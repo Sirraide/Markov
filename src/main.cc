@@ -5,6 +5,7 @@
 #include <vector>
 #include <codecvt>
 #include <locale>
+#include <regex>
 #include "../clopts/include/clopts.hh"
 
 template <typename tstring>
@@ -70,6 +71,20 @@ tstring trim(const tstring& str) {
     return str.substr(start, end - start);
 }
 
+/// Split a string by a regular expression.
+template <typename tstring>
+std::vector<tstring> split(const tstring& str, const tstring& re) {
+    std::vector<tstring> ret;
+    std::regex rex(re);
+    std::sregex_token_iterator iter(str.begin(), str.end(), rex, {-1, 0});
+    std::sregex_token_iterator end;
+    while (iter != end) {
+        ret.push_back(*iter);
+        iter++;
+    }
+    return ret;
+}
+
 
 template<typename tchar_t = char>
 struct markov_chain {
@@ -114,61 +129,91 @@ struct markov_chain {
 
 using namespace command_line_options;
 using options = clopts< // clang-format off
-    multiple<option<"-f", "The input file", file_data, true>>,
+    multiple<option<"-f", "The input file", file_data>>,
+    flag<"--stdin", "Read input from stdin instead">,
     option<"--length", "The maximum length of the output", int64_t>,
     option<"--lines", "How many lines to generate", int64_t>,
     option<"--order", "The order of the ngrams", int64_t>,
     option<"--seed", "The seed for the random number generator", int64_t>,
     option<"--min-line", "Ignore lines that are shorter than this", int64_t>,
+    option<"--split", "Split output by regex">,
     flag<"--dump-input", "Print the processed text instead of generating output">,
     help
 >; // clang-format on
 
-int main(int argc, char** argv) {
-    setlocale(LC_ALL, "");
-
-    auto opts = options::parse(argc, argv);
-
+void generate(options::parsed_options& opts, std::string& input) {
     size_t length = opts.has<"--length">() ? opts.get<"--length">() : 100;
     size_t lines = opts.has<"--lines">() ? opts.get<"--lines">() : 1;
     size_t order = opts.has<"--order">() ? opts.get<"--order">() : 6;
     size_t min_line = opts.has<"--min-line">() ? opts.get<"--min-line">() : 0;
 
+    /// Remove short line to avoid generating gibberish.
+    if (min_line) {
+        auto input_lines = split_lines(input);
+        std::erase_if(input_lines, [min_line](const auto& line) { return line.empty() || line.size() < min_line; });
+        input = fmt::format("{}", fmt::join(input_lines, "\n"));
+    }
+
+    /// Replace newlines with spaces.
+    char* c = input.data();
+    while (c = strchr(c, '\n'), c) *c = ' ';
+
+    /// Remove non-ascii chars.
+    static const std::string ascii_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'\".,-_:;!?() ";
+    std::erase_if(input, [](char c) { return !ascii_chars.contains(c); });
+
+    /// Convert to lowercase.
+    auto lower = to_lower(input);
+
+    /// Print the input if requested.
+    if (opts.has<"--dump-input">()) {
+        fmt::print("{}\n", lower);
+        return;
+    }
+
+    /// Convert to utf32.
+    auto str = to_utf32(lower);
+
+    /// Build the markov chain.
+    markov_chain<char32_t> mc(str, order);
+
+    /// Generate words.
+    for (size_t i = 0; i < lines; i++) {
+        auto out = to_utf8(mc.generate(length));
+
+        /// Split the output if requested.
+        if (opts.has<"--split">()) {
+            bool first = true;
+            for (auto& line : split(out, opts.get<"--split">())) {
+                if (first) first = false;
+                else if (line.size() > 5) fmt::print("\n");
+                fmt::print("{}", trim(line));
+            }
+        }
+
+        else fmt::print("{}\n", trim(out));
+    }
+}
+
+
+int main(int argc, char** argv) {
+    setlocale(LC_ALL, "");
+    auto opts = options::parse(argc, argv);
+
+    if (opts.has<"--stdin">()) {
+        std::string input;
+        std::string line;
+        while (std::getline(std::cin, line)) input += fmt::format("{}\n", line);
+        generate(opts, input);
+        return 0;
+    }
+
+    if (!opts.has<"-f">()) {
+        fmt::print(stderr, "{}", options::help());
+        std::exit(1);
+    }
+
     for (auto& input : opts.get<"-f">()) {
-        /// Remove short line to avoid generating gibberish.
-        if (min_line) {
-            auto input_lines = split_lines(input);
-            std::erase_if(input_lines, [min_line](const auto& line) { return line.empty() || line.size() < min_line; });
-            input = fmt::format("{}", fmt::join(input_lines, "\n"));
-        }
-
-        /// Replace newlines with spaces.
-        char* c = input.data();
-        while (c = strchr(c, '\n'), c) *c = ' ';
-
-        /// Remove non-ascii chars.
-        static const std::string ascii_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'\".,-_:;!?() ";
-        std::erase_if(input, [](char c) { return !ascii_chars.contains(c); });
-
-        /// Convert to lowercase.
-        auto lower = to_lower(input);
-
-        /// Print the input if requested.
-        if (opts.has<"--dump-input">()) {
-            fmt::print("{}\n", lower);
-            continue;
-        }
-
-        /// Convert to utf32.
-        auto str = to_utf32(lower);
-
-        /// Build the markov chain.
-        markov_chain<char32_t> mc(str, order);
-
-        /// Generate words.
-        for (size_t i = 0; i < lines; i++) {
-            auto out = to_utf8(mc.generate(length));
-            fmt::print("{}\n", trim(out));
-        }
+        generate(opts, input);
     }
 }
