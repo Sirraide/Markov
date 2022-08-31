@@ -1,0 +1,5 @@
+.idea/
+out/
+markov
+*.txt
+!input.txt
