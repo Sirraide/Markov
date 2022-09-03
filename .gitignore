@@ -2,4 +2,6 @@
 out/
 markov
 *.txt
+*.md
+!README.md
 !input.txt

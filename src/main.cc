@@ -1,12 +1,13 @@
+#include "../clopts/include/clopts.hh"
+
+#include <codecvt>
 #include <fmt/format.h>
 #include <fmt/xchar.h>
+#include <locale>
 #include <random>
+#include <regex>
 #include <unordered_map>
 #include <vector>
-#include <codecvt>
-#include <locale>
-#include <regex>
-#include "../clopts/include/clopts.hh"
 
 template <typename tstring>
 tstring to_lower(tstring str) {
@@ -85,8 +86,7 @@ std::vector<tstring> split(const tstring& str, const tstring& re) {
     return ret;
 }
 
-
-template<typename tchar_t = char>
+template <typename tchar_t = char>
 struct markov_chain {
     using tchar = tchar_t;
     using tstring = std::basic_string<tchar>;
@@ -94,8 +94,9 @@ struct markov_chain {
     size_t order;
     std::unordered_map<tstring, std::vector<tchar>> chain;
     std::mt19937 rng;
+    size_t seed;
 
-    markov_chain(const tstring& text, size_t order, size_t seed = std::random_device()()) : order(order) {
+    markov_chain(const tstring& text, size_t order, size_t _seed = std::random_device()()) : order(order), seed(_seed) {
         for (size_t i = 0; i < text.size() - order; i++)
             chain[text.substr(i, order)].push_back(text[i + order]);
         rng.seed(seed);
@@ -138,6 +139,8 @@ using options = clopts< // clang-format off
     option<"--min-line", "Ignore lines that are shorter than this", int64_t>,
     option<"--split", "Split output by regex">,
     flag<"--dump-input", "Print the processed text instead of generating output">,
+    flag<"--print-seed", "Print the seed used for the random number generator">,
+    flag<"--ascii", "Strip non-ascii characters">,
     help
 >; // clang-format on
 
@@ -159,8 +162,10 @@ void generate(options::parsed_options& opts, std::string& input) {
     while (c = strchr(c, '\n'), c) *c = ' ';
 
     /// Remove non-ascii chars.
-    static const std::string ascii_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'\".,-_:;!?() ";
-    std::erase_if(input, [](char c) { return !ascii_chars.contains(c); });
+    if (opts.has<"--ascii">()) {
+        static const std::string ascii_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'\".,-_:;!?() ";
+        std::erase_if(input, [](char c) { return !ascii_chars.contains(c); });
+    }
 
     /// Convert to lowercase.
     auto lower = to_lower(input);
@@ -181,6 +186,11 @@ void generate(options::parsed_options& opts, std::string& input) {
     for (size_t i = 0; i < lines; i++) {
         auto out = to_utf8(mc.generate(length));
 
+        /// Print the seed.
+        if (opts.has<"--print-seed">()) {
+            fmt::print("Seed: {}\n", mc.seed);
+        }
+
         /// Split the output if requested.
         if (opts.has<"--split">()) {
             bool first = true;
@@ -194,7 +204,6 @@ void generate(options::parsed_options& opts, std::string& input) {
         else fmt::print("{}\n", trim(out));
     }
 }
-
 
 int main(int argc, char** argv) {
     setlocale(LC_ALL, "");
