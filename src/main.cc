@@ -180,18 +180,18 @@ void generate(options::parsed_options& opts, std::string& input) {
     auto str = to_utf32(lower);
 
     /// Build the markov chain.
-    markov_chain<char32_t> mc(str, order);
+    markov_chain<char32_t> mc(str, order, opts.has<"--seed">() ? size_t(opts.get<"--seed">()) : size_t(std::random_device()()));
 
+    /// Print the seed.
+    if (opts.has<"--print-seed">()) {
+        fmt::print("Seed: {}\n", mc.seed);
+    }
+ 
     /// Generate words.
     for (size_t i = 0; i < lines; i++) {
         auto out = to_utf8(mc.generate(length));
 
-        /// Print the seed.
-        if (opts.has<"--print-seed">()) {
-            fmt::print("Seed: {}\n", mc.seed);
-        }
-
-        /// Split the output if requested.
+       /// Split the output if requested.
         if (opts.has<"--split">()) {
             bool first = true;
             for (auto& line : split(out, opts.get<"--split">())) {
