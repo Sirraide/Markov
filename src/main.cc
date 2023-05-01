@@ -1,46 +1,38 @@
-#include "../clopts/include/clopts.hh"
-
+#include <algorithm>
+#include <clopts.hh>
 #include <codecvt>
 #include <fmt/format.h>
 #include <fmt/xchar.h>
 #include <locale>
 #include <random>
+#include <ranges>
 #include <regex>
 #include <unordered_map>
 #include <vector>
 
-template <typename tstring>
-tstring to_lower(tstring str) {
-    std::transform(str.begin(), str.end(), str.begin(), [](unsigned char c) { return std::tolower(c); });
-    return str;
+namespace rgs = std::ranges;
+using c32 = char32_t;
+
+void to_lower(auto& str) {
+    rgs::transform(str, str.begin(), [](auto c) { return std::tolower(c); });
+}
+void to_upper(auto& str) {
+    rgs::transform(str, str.begin(), [](auto c) { return std::toupper(c); });
 }
 
-template <typename tstring>
-tstring to_upper(tstring str) {
-    std::transform(str.begin(), str.end(), str.begin(), [](unsigned char c) { return std::toupper(c); });
-    return str;
-}
-
-auto to_utf8(const auto& str)
-    -> decltype(std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t>{}.to_bytes(str)) //
-    requires requires { std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t>{}.to_bytes(str); }
-{
-    std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t> conv;
+auto to_utf8(const auto& str) -> std::string {
+    std::wstring_convert<std::codecvt_utf8<c32>, c32> conv;
     return conv.to_bytes(str);
 }
 
-auto to_utf32(const auto& str)
-    -> decltype(std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t>().from_bytes(str)) //
-    requires requires { std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t>{}.from_bytes(str); }
-{
-    std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t> conv;
+auto to_utf32(const auto& str) -> std::u32string {
+    std::wstring_convert<std::codecvt_utf8<c32>, c32> conv;
     return conv.from_bytes(str);
 }
 
 /// Split a string into lines.
-template <typename tstring>
-std::vector<tstring> split_lines(const tstring& str) {
-    std::vector<tstring> ret;
+auto split_lines(std::string_view str) -> std::vector<std::string_view> {
+    std::vector<std::string_view> ret;
     size_t start = 0;
     for (size_t i = 0; i < str.size(); i++) {
         if (str[i] == '\n') {
@@ -53,29 +45,17 @@ std::vector<tstring> split_lines(const tstring& str) {
 }
 
 /// Trim a string.
-template <typename tstring>
-tstring trim(const tstring& str) {
+auto trim(std::string_view str) -> std::string_view {
     size_t start = 0;
-    for (size_t i = 0; i < str.size(); i++) {
-        if (str[i] != ' ' && str[i] != '\t') {
-            start = i;
-            break;
-        }
-    }
+    while (start < str.size() and std::isspace(str[start])) start++;
     size_t end = str.size();
-    for (size_t i = str.size() - 1; i >= start; i--) {
-        if (str[i] != ' ' && str[i] != '\t') {
-            end = i + 1;
-            break;
-        }
-    }
+    while (end > start and std::isspace(str[end - 1])) end--;
     return str.substr(start, end - start);
 }
 
 /// Split a string by a regular expression.
-template <typename tstring>
-std::vector<tstring> split(const tstring& str, const tstring& re) {
-    std::vector<tstring> ret;
+auto split(const std::string& str, const std::string& re) -> std::vector<std::string> {
+    std::vector<std::string> ret;
     std::regex rex(re);
     std::sregex_token_iterator iter(str.begin(), str.end(), rex, {-1, 0});
     std::sregex_token_iterator end;
@@ -108,12 +88,12 @@ struct markov_chain {
 
         tstring ngram;
         for (;;) {
-            auto seed = chain.begin();
-            std::advance(seed, rng() % chain.size());
-            ngram = seed->first;
+            auto next = chain.begin();
+            std::advance(next, rng() % chain.size());
+            ngram = next->first;
             if (!ngram.starts_with(' ')) continue;
 
-            result.append(seed->first);
+            result.append(next->first);
             break;
         }
 
@@ -130,7 +110,7 @@ struct markov_chain {
 
 using namespace command_line_options;
 using options = clopts< // clang-format off
-    multiple<option<"-f", "The input file", file_data>>,
+    multiple<option<"-f", "The input files", file<>>>,
     flag<"--stdin", "Read input from stdin instead">,
     option<"--length", "The maximum length of the output", int64_t>,
     option<"--lines", "How many lines to generate", int64_t>,
@@ -141,19 +121,18 @@ using options = clopts< // clang-format off
     flag<"--dump-input", "Print the processed text instead of generating output">,
     flag<"--print-seed", "Print the seed used for the random number generator">,
     flag<"--ascii", "Strip non-ascii characters">,
-    help
+    help<>
 >; // clang-format on
 
-void generate(options::parsed_options& opts, std::string& input) {
-    size_t length = opts.has<"--length">() ? opts.get<"--length">() : 100;
-    size_t lines = opts.has<"--lines">() ? opts.get<"--lines">() : 1;
-    size_t order = opts.has<"--order">() ? opts.get<"--order">() : 6;
-    size_t min_line = opts.has<"--min-line">() ? opts.get<"--min-line">() : 0;
+void generate(std::string input) {
+    size_t length = options::get_or<"--length">(100);
+    size_t lines = options::get_or<"--lines">(1);
+    size_t order = options::get_or<"--order">(6);
 
-    /// Remove short line to avoid generating gibberish.
-    if (min_line) {
+    /// Remove short lines to avoid generating gibberish.
+    if (auto min_line = options::get<"--min-line">()) {
         auto input_lines = split_lines(input);
-        std::erase_if(input_lines, [min_line](const auto& line) { return line.empty() || line.size() < min_line; });
+        std::erase_if(input_lines, [min = size_t(*min_line)](const auto& line) { return line.empty() || line.size() < min; });
         input = fmt::format("{}", fmt::join(input_lines, "\n"));
     }
 
@@ -162,43 +141,42 @@ void generate(options::parsed_options& opts, std::string& input) {
     while (c = strchr(c, '\n'), c) *c = ' ';
 
     /// Remove non-ascii chars.
-    if (opts.has<"--ascii">()) {
+    if (options::get<"--ascii">()) {
         static const std::string ascii_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'\".,-_:;!?() ";
         std::erase_if(input, [](char c) { return !ascii_chars.contains(c); });
     }
 
     /// Convert to lowercase.
-    auto lower = to_lower(input);
+    to_lower(input);
 
     /// Print the input if requested.
-    if (opts.has<"--dump-input">()) {
-        fmt::print("{}\n", lower);
+    if (options::get<"--dump-input">()) {
+        fmt::print("{}\n", input);
         return;
     }
 
     /// Convert to utf32.
-    auto str = to_utf32(lower);
+    auto str = to_utf32(input);
 
     /// Build the markov chain.
-    markov_chain<char32_t> mc(str, order, opts.has<"--seed">() ? size_t(opts.get<"--seed">()) : size_t(std::random_device()()));
+    markov_chain<c32> mc(str, order, size_t(options::get_or<"--seed">(std::random_device()())));
 
     /// Print the seed.
-    if (opts.has<"--print-seed">()) {
-        fmt::print("Seed: {}\n", mc.seed);
-    }
- 
+    if (options::get<"--print-seed">()) fmt::print("Seed: {}\n", mc.seed);
+
     /// Generate words.
     for (size_t i = 0; i < lines; i++) {
         auto out = to_utf8(mc.generate(length));
 
-       /// Split the output if requested.
-        if (opts.has<"--split">()) {
+        /// Split the output if requested.
+        if (auto s = options::get<"--split">()) {
             bool first = true;
-            for (auto& line : split(out, opts.get<"--split">())) {
+            for (auto& line : split(out, *s)) {
                 if (first) first = false;
                 else if (line.size() > 5) fmt::print("\n");
                 fmt::print("{}", trim(line));
             }
+            fmt::print("\n");
         }
 
         else fmt::print("{}\n", trim(out));
@@ -207,22 +185,24 @@ void generate(options::parsed_options& opts, std::string& input) {
 
 int main(int argc, char** argv) {
     setlocale(LC_ALL, "");
-    auto opts = options::parse(argc, argv);
+    options::parse(argc, argv);
 
-    if (opts.has<"--stdin">()) {
+    if (options::get<"--stdin">()) {
         std::string input;
         std::string line;
-        while (std::getline(std::cin, line)) input += fmt::format("{}\n", line);
-        generate(opts, input);
+        while (std::getline(std::cin, line)) {
+            input += line;
+            input += '\n';
+        }
+        generate(std::move(input));
         return 0;
     }
 
-    if (!opts.has<"-f">()) {
+    auto fs = options::get<"-f">();
+    if (fs->empty()) {
         fmt::print(stderr, "{}", options::help());
-        std::exit(1);
+        return 1;
     }
 
-    for (auto& input : opts.get<"-f">()) {
-        generate(opts, input);
-    }
+    for (auto& input : *fs) generate(std::move(input.contents));
 }
