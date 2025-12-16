@@ -231,7 +231,7 @@ struct markov_chain {
     LIBBASE_SERIALISE(markov_chain, chain, order);
 
     /// Map from ngrams to [char, frequency] pairs.
-    using map_type = std::unordered_map<string_type, node>;
+    using map_type = HashMap<__int128, node>;
 
     map_type chain;
     usz order;
@@ -239,9 +239,13 @@ struct markov_chain {
     std::mt19937 rng;
 
     markov_chain(text_type text, usz order, usz _seed = std::random_device()()) : order(order), seed(_seed) {
+        Assert(order <= sizeof(__int128));
         ProfileTimer _{"build"};
-        for (usz i = 0; i < text.size() - order; i++)
-            chain[map_type::key_type{text.substr(i, order)}].add(text[i + order]);
+        for (usz i = 0; i < text.size() - order; i++) {
+            __int128 v{};
+            std::memcpy(&v, text.data() + i, order);
+            chain[v].add(text[i + order]);
+        }
         rng.seed(seed);
     }
 
@@ -251,7 +255,8 @@ struct markov_chain {
     }
 
     string_type generate(usz length) {
-        string_type result, ngram;
+        __int128 ngram;
+        string_type result;
         result.reserve(length);
 
         // Pick an ngram that starts with a space.
@@ -259,8 +264,9 @@ struct markov_chain {
             auto next = chain.begin();
             std::advance(next, rng() % chain.size());
             ngram = next->first;
-            if (!ngram.starts_with(' ')) continue;
-            result.append(next->first);
+            if ((ngram & 0xff) != ' ') continue;
+            result.resize(order);
+            std::memcpy(result.data(), &ngram, order);
             break;
         }
 
@@ -282,7 +288,7 @@ struct markov_chain {
             auto count = it->second.total_count();
             auto i = rng() % count;
             result += it->second.get(u32(i));
-            ngram = result.substr(iterations + 1, order);
+            std::memcpy(&ngram, result.data() + iterations + 1, order);
         }
 
         return result;
