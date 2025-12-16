@@ -12,6 +12,7 @@
 
 using namespace base;
 
+namespace {
 #ifdef USE_32_BIT_CHAIN
 using Character = char32_t;
 using String = std::u32string;
@@ -279,7 +280,7 @@ struct node {
         }
         return *this;
     }
-#endif // FREE_NODES
+#endif // not DISABLE_FREE
 
     void add(char_type c, u32 n = 1) {
         if (small) {
@@ -289,15 +290,51 @@ struct node {
             }
 
             // Make large.
-            small = false;
-            auto& large = *new large_t;
-            large[small_char()] = small_count();
-            large[c] = n;
-            data = reinterpret_cast<uptr>(&large);
+            make_large();
+            get_large()[c] = n;
             return;
         }
 
         get_large()[c] += n;
+    }
+
+    void make_large() {
+        small = false;
+        auto& large = *new large_t;
+        large[small_char()] = small_count();
+        data = reinterpret_cast<uptr>(&large);
+    }
+
+    void merge(node&& other) {
+        if (small) {
+            // Case 1: Both are small.
+            if (other.small) {
+                // Subcase: if the chars are the same, then we don’t have to allocate.
+                if (small_char() == other.small_char()) {
+                    inc_small_count(small_char(), other.small_count());
+                    return;
+                }
+
+                // The other node is small as well; make us large.
+                make_large();
+                add(other.small_char(), other.small_count());
+                return;
+            }
+
+            // Case 2: We are small, the other node is large, merge us into them.
+            other.add(small_char(), other.small_count());
+            *this = std::move(other);
+            return;
+        }
+
+        // Case 3: The other node is small, and we are already large.
+        if (other.small) {
+            add(other.small_char(), other.small_count());
+            return;
+        }
+
+        // Case 4: Both are large.
+        for (auto [c, freq] : other.get_large()) get_large()[c] += freq;
     }
 
     auto get(freq_type i) const -> char_type {
@@ -341,16 +378,90 @@ struct node {
     }
 };
 
+void IterateRangeInParallel(u64 num_els, u64 num_threads, auto elem_cb, auto done_cb) {
+    std::vector<std::jthread> threads;
+    u64 partition_size = num_els/num_threads;
+    for (u64 tid = 0; tid < num_threads; tid++) threads.emplace_back([&, tid] {
+        u64 last = (tid + 1) * partition_size;
+        if (tid == num_threads - 1) last += num_els % num_threads; // Include trailing data.
+        for (u64 i = tid * partition_size; i < last; i++) std::invoke(elem_cb, tid, i);
+        std::invoke(done_cb, tid);
+    });
+}
+
+
 struct markov_chain_builder {
     using char_type = char;
     using text_type = std::string_view;
+    using pair_type = std::pair<markov_chain::ngram_type, node>;
 
     /// Map from ngrams to [char, frequency] pairs.
-    using map_type = HashMap<markov_chain::ngram_type, node>;
+    using map_type = std::vector<pair_type>;
     map_type chain;
     usz order;
 
-    markov_chain_builder(text_type text, usz order, u32 num_collect_threads, u32 num_merge_threads) : order(order) {
+    // This is a merge sort that also merges the ngram frequency maps.
+    //
+    // Invariant: the inputs to merge() are sorted.
+    static auto merge(map_type&& a, map_type&& b) -> map_type {
+        DebugAssert(rgs::is_sorted(a, rgs::less(), &pair_type::first));
+        DebugAssert(rgs::is_sorted(b, rgs::less(), &pair_type::first));
+
+        map_type m;
+        auto ia = a.begin();
+        auto ib = b.begin();
+        auto ea = a.end();
+        auto eb = b.end();
+        auto Add = [&](markov_chain::ngram_type ngram, node n) {
+            if (m.empty() or m.back().first != ngram) m.emplace_back(ngram, std::move(n));
+            else m.back().second.merge(std::move(n));
+        };
+
+        while (ia != ea and ib != eb) {
+            if (ia->first <= ib->first) {
+                Add(ia->first, std::move(ia->second));
+                ++ia;
+            } else {
+                Add(ib->first, std::move(ib->second));
+                ++ib;
+            }
+        }
+
+        while (ia != ea) {
+            Add(ia->first, std::move(ia->second));
+            ++ia;
+        }
+
+        while (ib != eb) {
+            Add(ib->first, std::move(ib->second));
+            ++ib;
+        }
+
+        DebugAssert(rgs::is_sorted(m, rgs::less(), &pair_type::first));
+        return m;
+    }
+
+    static auto parallel_merge(MutableSpan<map_type> maps) -> map_type {
+        Assert(not maps.empty());
+        if (maps.size() == 1) return std::move(maps.front());
+        if (maps.size() == 2) return merge(std::move(maps[0]), std::move(maps[1]));
+        if (maps.size() == 3) return merge(
+            std::move(maps[0]),
+            merge(std::move(maps[1]), std::move(maps[2]))
+        );
+
+        map_type a, b;
+
+        {
+            auto half = maps.size() / 2;
+            std::jthread _{[&] { a = parallel_merge(maps.subspan(0, half)); }};
+            std::jthread _{[&] { b = parallel_merge(maps.subspan(half)); }};
+        }
+
+        return merge(std::move(a), std::move(b));
+    }
+
+    markov_chain_builder(text_type text, usz order, u32 num_collect_threads) : order(order) {
         Assert(order <= sizeof(markov_chain::ngram_type));
         ProfileTimer _{"build"};
         usz end = text.size() - order;
@@ -367,70 +478,43 @@ struct markov_chain_builder {
 
             // Iterate over 'num_els' elements using 'num_threads' in parallel, invoking
             // 'thread_cb' for each element with the thread id and index.
-            auto IterateRangeInParallel = [](u64 num_els, u64 num_threads, auto thread_cb) {
+            auto IterateRangeInParallel = [](u64 num_els, u64 num_threads, auto elem_cb, auto done_cb) {
                 std::vector<std::jthread> threads;
                 u64 partition_size = num_els/num_threads;
                 for (u64 tid = 0; tid < num_threads; tid++) threads.emplace_back([&, tid] {
                     u64 last = (tid + 1) * partition_size;
                     if (tid == num_threads - 1) last += num_els % num_threads; // Include trailing data.
-                    for (u64 i = tid * partition_size; i < last; i++) std::invoke(thread_cb, tid, i);
+                    for (u64 i = tid * partition_size; i < last; i++) std::invoke(elem_cb, tid, i);
+                    std::invoke(done_cb, tid);
                 });
             };
 
-            auto MergeMap = [](map_type& into, const map_type& src) {
-                for (auto& [k, v] : src) {
-                    if (v.small) into[k].add(v.small_char(), v.small_count());
-                    else {
-                        for (const auto& [c, freq] : v.get_large())
-                            into[k].add(c, freq);
-                    }
-                }
-            };
-
             // Heap-allocate and leak the maps since freeing them takes for ever.
-            auto collecting_ngrams_maps = new std::vector<map_type>;
-#ifndef DISABLE_FREE
-            defer { delete collecting_ngrams_maps; };
-#endif
+            std::vector<map_type> collecting_ngrams_maps;
             {
                 ProfileTimer _{"build: collecting ngrams"};
-                collecting_ngrams_maps->resize(num_collect_threads);
+                collecting_ngrams_maps.resize(num_collect_threads);
                 IterateRangeInParallel(end, num_collect_threads, [&](u64 tid, u64 i) {
                     markov_chain::ngram_type v{};
                     std::memcpy(&v, text.data() + i, order);
-                    collecting_ngrams_maps->at(tid)[v].add(text[i + order]);
+                    collecting_ngrams_maps.at(tid).emplace_back(v, node(text[i + order], 1));
+                }, [&](u64 tid) {
+                    rgs::sort(collecting_ngrams_maps.at(tid), rgs::less(), &pair_type::first);
                 });
             }
 
             // Merge the maps.
-            auto intermediate_merge_maps = new std::vector<map_type>;
-#ifndef DISABLE_FREE
-            defer { delete intermediate_merge_maps; };
-#endif
-            {
-                ProfileTimer _{"build: merging (intermediate)"};
-                intermediate_merge_maps->resize(num_merge_threads);
-                IterateRangeInParallel(collecting_ngrams_maps->size(), num_merge_threads, [&](u64 tid, u64 i) {
-                    MergeMap(intermediate_merge_maps->at(tid), collecting_ngrams_maps->at(i));
-                });
-            }
+            chain = parallel_merge(collecting_ngrams_maps);
 
-            if (num_merge_threads == 1) {
-                chain = std::move(intermediate_merge_maps->at(0));
-            } else {
-                ProfileTimer _{"build: merging (final)"};
-                for (auto& m : *intermediate_merge_maps) MergeMap(chain, m);
-            }
-
-                //if (i % 100000 == 0) {
-                //    std::print(
-                //        "\r{}/{} [{:3}%] ({} elapsed)                                                ",
-                //        i,
-                //        end,
-                //        u32((double(i) / double(end)) * 100),
-                //        chr::duration_cast<chr::seconds>(timer.elapsed())
-                //    );
-                //}
+            //if (i % 100000 == 0) {
+            //    std::print(
+            //        "\r{}/{} [{:3}%] ({} elapsed)                                                ",
+            //        i,
+            //        end,
+            //        u32((double(i) / double(end)) * 100),
+            //        chr::duration_cast<chr::seconds>(timer.elapsed())
+            //    );
+            //}
 
             //std::println();
         }
@@ -448,8 +532,7 @@ using options = clopts< // clang-format off
     option<"--split", "Split output by regex">,
     option<"--save-chain", "Save the chain to a file">,
     option<"--chain", "Load the chain from a file">,
-    option<"--collect-threads", "Threads to use to collect ngrams (set this as high as possible)", int64_t>,
-    option<"--merge-threads", "Threads to use to merge ngrams (set this lower)", int64_t>,
+    option<"--collect-threads", "Threads to use to collect ngrams; prefer to set this to a power of 2", int64_t>,
     flag<"--dump-input", "Print the processed text instead of generating output">,
     flag<"--dump-chain", "Print the chain’s contents">,
     flag<"--print-seed", "Print the seed used for the random number generator">,
@@ -548,28 +631,19 @@ void build_chain(options::optvals_type& opts, fs::PathRef into, str input) {
     markov_chain_builder mc(
         cleaned_up,
         order,
-        u32(opts.get<"--collect-threads">(std::thread::hardware_concurrency())),
-        u32(opts.get<"--collect-threads">(std::thread::hardware_concurrency() / 5))
+        u32(opts.get<"--collect-threads">(std::thread::hardware_concurrency()))
     );
 
     // Save the chain.
     header hdr{};
     std::vector<markov_chain::saved_ngram> ngram_buffer;
     std::vector<std::byte> freq_buffer;
-    std::vector<std::pair<markov_chain::ngram_type, node>> sorted;
-
-    // Sort the ngrams to facilitate binary search.
-    {
-        ProfileTimer _{"sorting"};
-        sorted.reserve(mc.chain.size());
-        for (auto& p : mc.chain) sorted.emplace_back(p.first, std::move(p.second));
-        rgs::sort(sorted, rgs::less(), &std::pair<markov_chain::ngram_type, node>::first);
-    }
 
     {
         ProfileTimer _{"serialising"};
+        DebugAssert(rgs::is_sorted(mc.chain, rgs::less(), &markov_chain_builder::pair_type::first));
         Writer freq_writer{freq_buffer};
-        for (const auto& [k, v] : sorted) {
+        for (const auto& [k, v] : mc.chain) {
             markov_chain::saved_ngram ngram{k, markov_chain::offset_type(freq_buffer.size())};
             ngram_buffer.push_back(ngram);
 
@@ -610,6 +684,7 @@ void build_chain(options::optvals_type& opts, fs::PathRef into, str input) {
     _Exit(0);
 }
 
+}
 int main(int argc, char** argv) {
     setlocale(LC_ALL, "");
     auto opts = options::parse(argc, argv);
