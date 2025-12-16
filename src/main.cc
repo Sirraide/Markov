@@ -20,6 +20,13 @@ using Character = char;
 using String = std::string;
 #endif
 
+enum class mode {
+    weighted,
+    random,
+    worst,
+    best,
+};
+
 // This program allocates a *lot* of memory because we build huge data structures,
 // so this flag disables freeing during the build phase because this ends up being
 // much faster.
@@ -192,14 +199,36 @@ struct markov_chain {
     /// at that ‘index’; e.g. if our map is {{'a', 10}, {'b', 5}, {'c', '20'}},
     /// then we pick an index I between 1 and 35, and the next character will
     /// be 'a' if I is in 0..<10, 'b' if it is in '10..<15', and 'c' otherwise.
-    auto ngram_get_random_char(const saved_ngram& n) -> char_type {
+    auto ngram_get_char(const saved_ngram& n, mode m) -> char_type {
         auto table_offs = data.data() + sizeof(hdr) + hdr.num_ngrams * sizeof(saved_ngram) + n.freq_pairs_list_offset;
         auto table = reinterpret_cast<const freq_table*>(table_offs);
-        auto i = rng() % table->num_elements;
-        freq_size_type sum = 0;
-        for (auto e : table->elements()) {
-            sum += e.freq;
-            if (i <= sum) return e.c;
+        auto els = table->elements();
+        switch (m) {
+            case mode::weighted: {
+                auto total = rgs::fold_left(els, 0u, [](auto a, auto& p) { return a + p.freq; });
+                auto i = rng() % total;
+                freq_size_type sum = 0;
+                for (auto e : els) {
+                    sum += e.freq;
+                    if (i <= sum) return e.c;
+                }
+                Unreachable();
+            }
+
+            case mode::random: {
+                auto i = rng() % table->num_elements;
+                return els[i].c;
+            }
+
+            case mode::best: {
+                auto it = rgs::max_element(els, rgs::less(), &freq_table_entry::freq);
+                return it->c;
+            }
+
+            case mode::worst: {
+                auto it = rgs::min_element(els, rgs::less(), &freq_table_entry::freq);
+                return it->c;
+            }
         }
         Unreachable();
     }
@@ -219,7 +248,7 @@ struct markov_chain {
         }
     }
 
-    string_type generate(usz length) {
+    string_type generate(usz length, mode m) {
         ngram_type ngram;
         string_type result;
         result.reserve(length);
@@ -236,7 +265,7 @@ struct markov_chain {
         for (usz iterations = 0; iterations < length; iterations++) {
             auto n = find_ngram(ngram);
             if (not n.has_value()) break;
-            result += ngram_get_random_char(*n);
+            result += ngram_get_char(*n, m);
             std::memcpy(&ngram, result.data() + iterations + 1, hdr.order);
         }
 
@@ -496,6 +525,9 @@ using options = clopts< // clang-format off
     flag<"--print-seed", "Print the seed used for the random number generator">,
     flag<"--ascii", "Strip non-ascii characters">,
     flag<"--skip-preprocess", "Do not preprocess the input">,
+    flag<"--worst", "Always pick the character with the lowest probability">,
+    flag<"--best", "Always pick the character with the highest probability">,
+    flag<"--random", "Pick the character at random, ignoring probabilities">,
     help<>
 >; // clang-format on
 
@@ -544,13 +576,19 @@ void generate(options::optvals_type& opts, markov_chain& mc) {
     // Print the seed.
     if (opts.get<"--print-seed">()) std::println(stderr, "Seed: {}", mc.seed);
 
+    // Figure out the mode.
+    mode m = mode::weighted;
+    if (opts.get<"--worst">()) m = mode::worst;
+    if (opts.get<"--best">()) m = mode::best;
+    if (opts.get<"--random">()) m = mode::random;
+
     // Generate words.
     ProfileTimer _{"generate"};
     for (usz i = 0; i < lines; i++) {
 #ifdef USE_32_BIT_CHAIN
-        auto out = text::ToUTF8(mc.generate(length));
+        auto out = text::ToUTF8(mc.generate(length, m));
 #else
-        auto out = mc.generate(length);
+        auto out = mc.generate(length, m);
 #endif
 
         // Split the output if requested.
