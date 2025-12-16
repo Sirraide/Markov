@@ -100,6 +100,130 @@ auto split(str s, std::string_view re) -> std::vector<str> {
     return ret;
 }
 
+//#define FREE_NODES
+
+struct node {
+    using large_t = std::flat_map<char, u32>;
+    uptr data : 63 = 0;
+    uptr small : 1 = true;
+
+    node() = default;
+    node(char c, u32 n) { inc_small_count(c, n); }
+    node(large_t l) {
+        small = false;
+        data = reinterpret_cast<uptr>(new large_t(std::move(l)));
+    }
+
+#ifdef FREE_NODES
+    ~node() {
+        if (not small) delete &get_large();
+    }
+    node(const node&) = delete;
+    node& operator=(const node&) = delete;
+    node(node&& other) : data(other.data), small(other.small) {
+        other.small = true;
+        other.data = 0;
+    }
+
+    node& operator=(node&& other) {
+        if (std::addressof(other) != this) {
+            if (not small) delete &get_large();
+            small = other.small;
+            data = other.data;
+            other.small = true;
+            other.data = 0;
+        }
+        return *this;
+    }
+#endif // FREE_NODES
+
+    void add(char c) {
+        if (small) {
+            if (data == 0 or small_char() == c) {
+                inc_small_count(c);
+                return;
+            }
+
+            // Make large.
+            small = false;
+            auto& large = *new large_t;
+            large[small_char()] = small_count();
+            large[c] = 1;
+            data = reinterpret_cast<uptr>(&large);
+            return;
+        }
+
+        ++get_large()[c];
+    }
+
+    auto get(u32 i) const -> char {
+        if (small) return small_char();
+        u32 n = 0;
+        for (auto [c, p] : get_large()) {
+            if (i < n + p) return c;
+            n += p;
+        }
+        Unreachable();
+    }
+
+    [[clang::always_inline]] auto get_large() -> large_t& {
+        return *reinterpret_cast<large_t*>(data);
+    }
+
+    [[clang::always_inline]] auto get_large() const -> const large_t& {
+        return *reinterpret_cast<const large_t*>(data);
+    }
+
+    [[clang::always_inline]] auto small_char() const -> char {
+        return char(data & 0xff);
+    }
+
+    [[clang::always_inline]] auto small_count() const -> u32 {
+        return u32(data >> 8);
+    }
+
+    [[clang::always_inline]] void inc_small_count(char c, u32 n = 1) {
+        data = (small_count() + n) << 8 | u32(c);
+    }
+
+    [[clang::always_inline]] auto count() const -> u32 {
+        if (small) return 1;
+        return u32(get_large().size());
+    }
+
+    auto total_count() const -> u32 {
+        if (small) return small_count();
+        return rgs::fold_left(get_large().values(), 0u, [](auto a, auto& v) { return a + v; });
+    }
+};
+
+template <>
+struct ser::Serialiser<node> {
+    static auto deserialise(auto& r) -> Result<node> {
+        auto count = Try(r.template read<u32>());
+        if (count == 0) return node();
+        if (count == 1) {
+            auto c = Try(r.template read<char>());
+            auto n = Try(r.template read<u32>());
+            return node(c, n);
+        }
+
+        return node(Try(r.template read<node::large_t>()));
+    }
+
+    static void serialise(auto& w, const node& n) {
+        auto count = n.count();
+        w << count;
+        if (count == 0) return;
+        if (count == 1) {
+            w <<  n.small_char() << n.small_count();
+            return;
+        }
+
+        w << n.get_large();
+    }
+};
+
 struct markov_chain {
     using char_type = Character;
     using text_type = std::basic_string_view<char_type>;
@@ -107,7 +231,7 @@ struct markov_chain {
     LIBBASE_SERIALISE(markov_chain, chain, order);
 
     /// Map from ngrams to [char, frequency] pairs.
-    using map_type = std::unordered_map<string_type, std::unordered_map<char, u32>>;
+    using map_type = std::unordered_map<string_type, node>;
 
     map_type chain;
     usz order;
@@ -117,7 +241,7 @@ struct markov_chain {
     markov_chain(text_type text, usz order, usz _seed = std::random_device()()) : order(order), seed(_seed) {
         ProfileTimer _{"build"};
         for (usz i = 0; i < text.size() - order; i++)
-            chain[map_type::key_type{text.substr(i, order)}][text[i + order]]++;
+            chain[map_type::key_type{text.substr(i, order)}].add(text[i + order]);
         rng.seed(seed);
     }
 
@@ -155,21 +279,9 @@ struct markov_chain {
             // at that ‘index’; e.g. if our map is {{'a', 10}, {'b', 5}, {'c', '20'}},
             // then we pick an index I between 1 and 35, and the next character will
             // be 'a' if I is in 0..<10, 'b' if it is in '10..<15', and 'c' otherwise.
-            auto count = rgs::fold_left(it->second, 0zu, [](auto a, auto& pair) { return a + pair.second; });
+            auto count = it->second.total_count();
             auto i = rng() % count;
-            auto n = 0zu;
-            bool appended = false;
-            for (auto [c, p] : it->second) {
-                if (i < n + p) {
-                    appended = true;
-                    result += c;
-                    break;
-                }
-
-                n += p;
-            }
-
-            Assert(appended);
+            result += it->second.get(u32(i));
             ngram = result.substr(iterations + 1, order);
         }
 
@@ -299,15 +411,15 @@ int main(int argc, char** argv) {
     if (auto* chain_file = opts.get<"--load-chain">()) {
         Timer t{0ms};
         markov_chain mc{ser::Deserialise<markov_chain, std::endian::native>(chain_file->contents).value()};
-        markov_chain::map_type m;
-        int x = 0;
-        for (auto p : mc.chain) {
-            m.insert(std::move(p));
-            if (x++ == 1000) break;
-        }
-
-        std::println("{}", m);
-        _Exit(41);
+        //markov_chain::map_type m;
+        //int x = 0;
+        //for (auto p : mc.chain) {
+        //    m.insert(std::move(p));
+        //    if (x++ == 1000) break;
+        //}
+        //
+        //std::println("{}", m);
+        //_Exit(41);
         //std::unordered_map<int, int> x;
         //for (const auto& [k, v] : mc.chain) x[v.size()]++;
         //for (const auto& [k, v] : x) std::println("{} : {}", k, v);
