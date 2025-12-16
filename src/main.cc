@@ -1,5 +1,4 @@
 #include <base/Base.hh>
-#include <base/Compression.hh>
 #include <base/FS.hh>
 #include <base/Serialisation.hh>
 #include <base/Text.hh>
@@ -248,7 +247,7 @@ struct markov_chain {
 struct node {
     using char_type = markov_chain::char_type;
     using freq_type = markov_chain::freq_size_type;
-    using large_t = std::flat_map<char_type, freq_type>;
+    using large_t = std::vector<std::pair<char_type, freq_type>>;
     uptr data : 63 = 0;
     uptr small : 1 = true;
 
@@ -291,17 +290,25 @@ struct node {
 
             // Make large.
             make_large();
-            get_large()[c] = n;
+            get_large().emplace_back(c, n);
             return;
         }
 
-        get_large()[c] += n;
+        add_to_large(c, n);
+    }
+
+    void add_to_large(char_type c, u32 n) {
+        DebugAssert(not small);
+        auto& l = get_large();
+        auto it = rgs::find(l, c, &std::pair<char_type, freq_type>::first);
+        if (it == l.end()) l.emplace_back(c, n);
+        else it->second += n;
     }
 
     void make_large() {
         small = false;
         auto& large = *new large_t;
-        large[small_char()] = small_count();
+        large.emplace_back(small_char(), small_count());
         data = reinterpret_cast<uptr>(&large);
     }
 
@@ -334,17 +341,7 @@ struct node {
         }
 
         // Case 4: Both are large.
-        for (auto [c, freq] : other.get_large()) get_large()[c] += freq;
-    }
-
-    auto get(freq_type i) const -> char_type {
-        if (small) return small_char();
-        freq_type n = 0;
-        for (auto [c, p] : get_large()) {
-            if (i < n + p) return c;
-            n += p;
-        }
-        Unreachable();
+        for (auto [c, freq] : other.get_large()) add_to_large(c, freq);
     }
 
     [[clang::always_inline]] auto get_large() -> large_t& {
@@ -371,24 +368,7 @@ struct node {
         if (small) return 1;
         return freq_type(get_large().size());
     }
-
-    auto total_count() const -> freq_type {
-        if (small) return small_count();
-        return rgs::fold_left(get_large().values(), 0u, [](auto a, auto& v) { return a + v; });
-    }
 };
-
-void IterateRangeInParallel(u64 num_els, u64 num_threads, auto elem_cb, auto done_cb) {
-    std::vector<std::jthread> threads;
-    u64 partition_size = num_els/num_threads;
-    for (u64 tid = 0; tid < num_threads; tid++) threads.emplace_back([&, tid] {
-        u64 last = (tid + 1) * partition_size;
-        if (tid == num_threads - 1) last += num_els % num_threads; // Include trailing data.
-        for (u64 i = tid * partition_size; i < last; i++) std::invoke(elem_cb, tid, i);
-        std::invoke(done_cb, tid);
-    });
-}
-
 
 struct markov_chain_builder {
     using char_type = char;
@@ -466,16 +446,6 @@ struct markov_chain_builder {
         ProfileTimer _{"build"};
         usz end = text.size() - order;
         {
-            // Hide/restore the cursor.
-            //std::print("\033[?25l");
-            //std::signal(SIGINT, [](int) {
-            //    std::print("\033[?25h");
-            //    std::fflush(stdout);
-            //    _Exit(1);
-            //});
-            //
-            //defer { std::print("\033[?25h"); };
-
             // Iterate over 'num_els' elements using 'num_threads' in parallel, invoking
             // 'thread_cb' for each element with the thread id and index.
             auto IterateRangeInParallel = [](u64 num_els, u64 num_threads, auto elem_cb, auto done_cb) {
@@ -505,18 +475,6 @@ struct markov_chain_builder {
 
             // Merge the maps.
             chain = parallel_merge(collecting_ngrams_maps);
-
-            //if (i % 100000 == 0) {
-            //    std::print(
-            //        "\r{}/{} [{:3}%] ({} elapsed)                                                ",
-            //        i,
-            //        end,
-            //        u32((double(i) / double(end)) * 100),
-            //        chr::duration_cast<chr::seconds>(timer.elapsed())
-            //    );
-            //}
-
-            //std::println();
         }
     }
 };
