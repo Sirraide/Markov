@@ -4,10 +4,11 @@
 #include <base/Serialisation.hh>
 #include <base/Text.hh>
 #include <clopts.hh>
+#include <csignal>
 #include <print>
 #include <random>
 #include <regex>
-#include <csignal>
+#include <thread>
 
 using namespace base;
 
@@ -18,6 +19,11 @@ using String = std::u32string;
 using Character = char;
 using String = std::string;
 #endif
+
+// This program allocates a *lot* of memory because we build huge data structures,
+// so this flag disables freeing during the build phase because this ends up being
+// much faster.
+#define DISABLE_FREE
 
 using Reader = ser::Reader<std::endian::native>;
 using Writer = ser::Writer<std::endian::native>;
@@ -104,8 +110,6 @@ auto split(str s, std::string_view re) -> std::vector<str> {
     }
     return ret;
 }
-
-//#define FREE_NODES
 
 struct header {
     static constexpr u32 CurrentVersion = 1;
@@ -254,7 +258,7 @@ struct node {
         data = reinterpret_cast<uptr>(new large_t(std::move(l)));
     }
 
-#ifdef FREE_NODES
+#ifndef DISABLE_FREE
     ~node() {
         if (not small) delete &get_large();
     }
@@ -277,10 +281,10 @@ struct node {
     }
 #endif // FREE_NODES
 
-    void add(char_type c) {
+    void add(char_type c, u32 n = 1) {
         if (small) {
             if (data == 0 or small_char() == c) {
-                inc_small_count(c);
+                inc_small_count(c, n);
                 return;
             }
 
@@ -288,12 +292,12 @@ struct node {
             small = false;
             auto& large = *new large_t;
             large[small_char()] = small_count();
-            large[c] = 1;
+            large[c] = n;
             data = reinterpret_cast<uptr>(&large);
             return;
         }
 
-        ++get_large()[c];
+        get_large()[c] += n;
     }
 
     auto get(freq_type i) const -> char_type {
@@ -340,51 +344,102 @@ struct node {
 struct markov_chain_builder {
     using char_type = char;
     using text_type = std::string_view;
-    LIBBASE_SERIALISE(markov_chain_builder, chain, order);
 
     /// Map from ngrams to [char, frequency] pairs.
     using map_type = HashMap<markov_chain::ngram_type, node>;
-
     map_type chain;
     usz order;
 
-    markov_chain_builder(text_type text, usz order) : order(order) {
+    markov_chain_builder(text_type text, usz order, u32 num_collect_threads, u32 num_merge_threads) : order(order) {
         Assert(order <= sizeof(markov_chain::ngram_type));
-        ProfileTimer timer{"build"};
+        ProfileTimer _{"build"};
         usz end = text.size() - order;
         {
             // Hide/restore the cursor.
-            std::print("\033[?25l");
-            std::signal(SIGINT, [](int) {
-                std::print("\033[?25h");
-                std::fflush(stdout);
-                _Exit(1);
-            });
+            //std::print("\033[?25l");
+            //std::signal(SIGINT, [](int) {
+            //    std::print("\033[?25h");
+            //    std::fflush(stdout);
+            //    _Exit(1);
+            //});
+            //
+            //defer { std::print("\033[?25h"); };
 
-            defer { std::print("\033[?25h"); };
-            for (usz i = 0; i < end; i++) {
-                if (i % 100000 == 0) {
-                    std::print(
-                        "\r{}/{} [{:3}%] ({} elapsed)                                                ",
-                        i,
-                        end,
-                        u32((double(i) / double(end)) * 100),
-                        chr::duration_cast<chr::seconds>(timer.elapsed())
-                    );
+            // Iterate over 'num_els' elements using 'num_threads' in parallel, invoking
+            // 'thread_cb' for each element with the thread id and index.
+            auto IterateRangeInParallel = [](u64 num_els, u64 num_threads, auto thread_cb) {
+                std::vector<std::jthread> threads;
+                u64 partition_size = num_els/num_threads;
+                for (u64 tid = 0; tid < num_threads; tid++) threads.emplace_back([&, tid] {
+                    u64 last = (tid + 1) * partition_size;
+                    if (tid == num_threads - 1) last += num_els % num_threads; // Include trailing data.
+                    for (u64 i = tid * partition_size; i < last; i++) std::invoke(thread_cb, tid, i);
+                });
+            };
+
+            auto MergeMap = [](map_type& into, const map_type& src) {
+                for (auto& [k, v] : src) {
+                    if (v.small) into[k].add(v.small_char(), v.small_count());
+                    else {
+                        for (const auto& [c, freq] : v.get_large())
+                            into[k].add(c, freq);
+                    }
                 }
+            };
 
-                markov_chain::ngram_type v{};
-                std::memcpy(&v, text.data() + i, order);
-                chain[v].add(text[i + order]);
+            // Heap-allocate and leak the maps since freeing them takes for ever.
+            auto collecting_ngrams_maps = new std::vector<map_type>;
+#ifndef DISABLE_FREE
+            defer { delete collecting_ngrams_maps; };
+#endif
+            {
+                ProfileTimer _{"build: collecting ngrams"};
+                collecting_ngrams_maps->resize(num_collect_threads);
+                IterateRangeInParallel(end, num_collect_threads, [&](u64 tid, u64 i) {
+                    markov_chain::ngram_type v{};
+                    std::memcpy(&v, text.data() + i, order);
+                    collecting_ngrams_maps->at(tid)[v].add(text[i + order]);
+                });
             }
-            std::println();
+
+            // Merge the maps.
+            auto intermediate_merge_maps = new std::vector<map_type>;
+#ifndef DISABLE_FREE
+            defer { delete intermediate_merge_maps; };
+#endif
+            {
+                ProfileTimer _{"build: merging (intermediate)"};
+                intermediate_merge_maps->resize(num_merge_threads);
+                IterateRangeInParallel(collecting_ngrams_maps->size(), num_merge_threads, [&](u64 tid, u64 i) {
+                    MergeMap(intermediate_merge_maps->at(tid), collecting_ngrams_maps->at(i));
+                });
+            }
+
+            if (num_merge_threads == 1) {
+                chain = std::move(intermediate_merge_maps->at(0));
+            } else {
+                ProfileTimer _{"build: merging (final)"};
+                for (auto& m : *intermediate_merge_maps) MergeMap(chain, m);
+            }
+
+                //if (i % 100000 == 0) {
+                //    std::print(
+                //        "\r{}/{} [{:3}%] ({} elapsed)                                                ",
+                //        i,
+                //        end,
+                //        u32((double(i) / double(end)) * 100),
+                //        chr::duration_cast<chr::seconds>(timer.elapsed())
+                //    );
+                //}
+
+            //std::println();
         }
     }
 };
 
 using namespace command_line_options;
 using options = clopts< // clang-format off
-    positional<"input", "The input files", file<>>,
+    positional<"input", "The input files", file<>, false>,
     option<"--length", "The maximum length of the output", int64_t>,
     option<"--lines", "How many lines to generate", int64_t>,
     option<"--order", "The order of the ngrams", int64_t>,
@@ -393,6 +448,8 @@ using options = clopts< // clang-format off
     option<"--split", "Split output by regex">,
     option<"--save-chain", "Save the chain to a file">,
     option<"--chain", "Load the chain from a file">,
+    option<"--collect-threads", "Threads to use to collect ngrams (set this as high as possible)", int64_t>,
+    option<"--merge-threads", "Threads to use to merge ngrams (set this lower)", int64_t>,
     flag<"--dump-input", "Print the processed text instead of generating output">,
     flag<"--dump-chain", "Print the chain’s contents">,
     flag<"--print-seed", "Print the seed used for the random number generator">,
@@ -417,7 +474,6 @@ auto clean_up_input(options::optvals_type& opts, str input) -> String {
         ProfileTimer _{"cleanup: fold ws"};
         cleaned_up = input.fold_ws();
     }
-
 
     // Remove non-ascii chars.
     if (opts.get<"--ascii">()) {
@@ -488,18 +544,32 @@ void build_chain(options::optvals_type& opts, fs::PathRef into, str input) {
     }
 
     // Build the markov chain.
-    markov_chain_builder mc(cleaned_up, order);
+    ProfileTimer timer{"total"};
+    markov_chain_builder mc(
+        cleaned_up,
+        order,
+        u32(opts.get<"--collect-threads">(std::thread::hardware_concurrency())),
+        u32(opts.get<"--collect-threads">(std::thread::hardware_concurrency() / 5))
+    );
 
     // Save the chain.
     header hdr{};
     std::vector<markov_chain::saved_ngram> ngram_buffer;
     std::vector<std::byte> freq_buffer;
+    std::vector<std::pair<markov_chain::ngram_type, node>> sorted;
+
+    // Sort the ngrams to facilitate binary search.
+    {
+        ProfileTimer _{"sorting"};
+        sorted.reserve(mc.chain.size());
+        for (auto& p : mc.chain) sorted.emplace_back(p.first, std::move(p.second));
+        rgs::sort(sorted, rgs::less(), &std::pair<markov_chain::ngram_type, node>::first);
+    }
 
     {
         ProfileTimer _{"serialising"};
         Writer freq_writer{freq_buffer};
-
-        for (const auto& [k, v] : mc.chain) {
+        for (const auto& [k, v] : sorted) {
             markov_chain::saved_ngram ngram{k, markov_chain::offset_type(freq_buffer.size())};
             ngram_buffer.push_back(ngram);
 
@@ -516,8 +586,6 @@ void build_chain(options::optvals_type& opts, fs::PathRef into, str input) {
             }
         }
 
-        // Sort the engrams to enable binary search.
-        rgs::sort(ngram_buffer, rgs::less(), &markov_chain::saved_ngram::ngram);
         hdr.num_ngrams = ngram_buffer.size();
         hdr.order = u16(mc.order);
     }
@@ -530,8 +598,16 @@ void build_chain(options::optvals_type& opts, fs::PathRef into, str input) {
         f.write(freq_buffer).value();
     }
 
+    // Report this one manually since we’re about to exit without
+    // running any destructors.
+    std::println("[{}]: {} elapsed", timer.scope, timer.elapsed());
+
+    // Flush streams.
+    std::fflush(stdout);
     std::fflush(stderr);
-    _Exit(0); // Avoid freeing everything we allocated.
+
+    // Avoid freeing everything we allocated.
+    _Exit(0);
 }
 
 int main(int argc, char** argv) {
@@ -563,5 +639,10 @@ int main(int argc, char** argv) {
     }
 
     auto input = opts.get<"input">();
+    if (not input) {
+        std::println(stderr, "Input file is required when building a chain");
+        return 1;
+    }
+
     build_chain(opts, *into, input->contents);
 }
